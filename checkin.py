@@ -26,18 +26,88 @@ logging.basicConfig(
 logger = logging.getLogger("GLaDOS")
 
 # ==================== 配置 ====================
-CHECKIN_URL = "https://glados.cloud/api/user/checkin"
-STATUS_URL = "https://glados.cloud/api/user/status"
-POINTS_URL = "https://glados.cloud/api/user/points"
-EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
-HEADERS_BASE = {
-    "origin": "https://glados.cloud",
-    "referer": "https://glados.cloud/console/checkin",
-    "user-agent": (
+# 站点基址：可用 GLADOS_BASE_URL 覆盖（便于本地用模拟服务端做端到端自测）
+BASE_URL = (os.getenv("GLADOS_BASE_URL") or "https://glados.cloud").rstrip("/")
+CHECKIN_URL = f"{BASE_URL}/api/user/checkin"
+STATUS_URL = f"{BASE_URL}/api/user/status"
+POINTS_URL = f"{BASE_URL}/api/user/points"
+EXCHANGE_URL = f"{BASE_URL}/api/user/exchange"
+
+# ==================== 设备平台 User-Agent ====================
+# GLaDOS 会对签到请求做「设备平台校验」：当签到请求的 UA 平台与账号**登录设备平台**
+# 不一致时，接口返回 {"code":4,"reason":"device-mismatch","loginDevice":"macOS"}，
+# message 为 "Automated check-in detected. Please sign in again to continue."。
+# 关键点：**版本号无关，只有平台 token 参与判定**（Macintosh / Windows NT / Linux / iPhone / Android）。
+PLATFORM_UA = {
+    "macOS": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Windows": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Linux": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "iOS": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Android": (
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+}
+# 默认平台：与历史行为保持一致（Windows），自动适配失败时的兜底平台由
+# GLADOS_UA_PLATFORM 覆盖，未设置时用 macOS（桌面端登录最常见）。
+DEFAULT_UA_PLATFORM = "Windows"
+FALLBACK_UA_PLATFORM = "macOS"
+
+
+def resolve_user_agent() -> str:
+    """
+    解析本次运行使用的 User-Agent，优先级：
+      1. GLADOS_USER_AGENT  —— 直接指定完整 UA（最精确，建议填浏览器 navigator.userAgent）
+      2. GLADOS_UA_PLATFORM —— 指定平台名（macOS / Windows / Linux / iOS / Android）
+      3. 内置默认（Windows）
+    """
+    ua = (os.getenv("GLADOS_USER_AGENT") or "").strip()
+    if ua:
+        return ua
+    plat = (os.getenv("GLADOS_UA_PLATFORM") or "").strip()
+    if plat:
+        for name, value in PLATFORM_UA.items():
+            if name.lower() == plat.lower():
+                return value
+        logger.warning(
+            "GLADOS_UA_PLATFORM 值 '%s' 无效，可选: %s；改用默认 %s",
+            plat, " / ".join(PLATFORM_UA), DEFAULT_UA_PLATFORM,
+        )
+    return PLATFORM_UA[DEFAULT_UA_PLATFORM]
+
+
+def ua_platform(user_agent: str) -> str:
+    """从 UA 字符串反推平台名（仅用于日志可读性，不参与判定）。"""
+    ua = (user_agent or "")
+    for token, name in (
+        ("Macintosh", "macOS"), ("iPhone", "iOS"), ("iPad", "iOS"),
+        ("Android", "Android"), ("Windows NT", "Windows"), ("Linux", "Linux"),
+    ):
+        if token in ua:
+            return name
+    return "未知"
+
+
+HEADERS_BASE = {
+    "origin": BASE_URL,
+    "referer": f"{BASE_URL}/console/checkin",
+    "user-agent": resolve_user_agent(),
     # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
     # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
@@ -66,6 +136,25 @@ _SIG_KEY_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9_.-]+):sess\.sig$")
 # 服务端鉴权失败关键词：命中说明 Cookie 已失效/复制不完整，而非格式问题，
 # 需与「格式校验失败」区分，给出「重新获取 Cookie」的可操作提示。
 AUTH_FAIL_KEYWORDS = ("没有权限", "权限不足", "未登录", "登录已失效", "unauthorized", "forbidden", "invalid token")
+# 设备平台校验失败（code=4 / reason=device-mismatch）的识别关键词。
+# 命中说明 Cookie 本身有效（账号信息都能读到），只是「签到请求 UA 平台 ≠ 登录设备平台」，
+# 处理方式是切换 UA 重试，而不是让用户重新抓 Cookie。
+DEVICE_MISMATCH_CODE = 4
+DEVICE_MISMATCH_REASON = "device-mismatch"
+DEVICE_MISMATCH_KEYWORDS = (
+    "automated check-in detected",
+    "device-mismatch",
+    "device mismatch",
+    "sign in again",
+)
+DEVICE_MISMATCH_HINT = (
+    "设备平台不匹配：本脚本默认使用 Windows UA，而你的 Cookie 是在别的平台登录的。"
+    "解决方式（任选其一）：\n"
+    "  A. 把浏览器 F12 → Console 执行 navigator.userAgent 的结果填到仓库 Secret/Variable "
+    "GLADOS_USER_AGENT（最精确）；\n"
+    "  B. 设置 GLADOS_UA_PLATFORM=macOS / Windows / Linux / iOS / Android 指明登录平台；\n"
+    "  C. 回到 glados.cloud 重新登录并手动签到一次、再重新抓 Cookie（会话风控标记时有效）。"
+)
 # Cookie 缺失/不合法时统一输出的期望格式说明（便于用户自查与在日志中直接定位）
 COOKIE_FORMAT_HINT = (
     "期望 Cookie 格式（前缀任意，sess 与 sess.sig 必须成对出现）:\n"
@@ -587,12 +676,119 @@ def classify_checkin(code: Any, message: str) -> str:
     return "fail"
 
 
+def is_device_mismatch(resp: Dict[str, Any]) -> bool:
+    """
+    判断响应是否为「设备平台不匹配」（GLaDOS 的设备校验拒绝）。
+
+    判定依据（任一命中）：
+      - code == 4（现网该错误码即设备校验失败）
+      - reason == "device-mismatch"
+      - message 命中 DEVICE_MISMATCH_KEYWORDS
+    注意：这与「Cookie 失效（没有权限 / code=-2）」是**两类完全不同**的问题，
+    前者换 UA 即可，后者才需要重新抓 Cookie。
+    """
+    if not isinstance(resp, dict):
+        return False
+    try:
+        code = int(resp.get("code"))
+    except (TypeError, ValueError):
+        code = None
+    reason = str(resp.get("reason") or "").strip().lower()
+    msg = str(resp.get("message") or "").lower()
+    if code == DEVICE_MISMATCH_CODE:
+        return True
+    if reason == DEVICE_MISMATCH_REASON:
+        return True
+    return any(kw in msg for kw in DEVICE_MISMATCH_KEYWORDS)
+
+
+def pick_ua_for_device(login_device: str, current_ua: str) -> Optional[str]:
+    """
+    按服务端返回的 loginDevice 选一个平台 UA。
+    未收录的平台名按关键字粗匹配；无法判定时返回 None（交由调用方决定兜底策略）。
+    """
+    dev = (login_device or "").strip()
+    if not dev:
+        return None
+    for name, value in PLATFORM_UA.items():
+        if name.lower() == dev.lower():
+            return value
+    low = dev.lower()
+    for token, name in (
+        ("mac", "macOS"), ("osx", "macOS"), ("darwin", "macOS"),
+        ("iphone", "iOS"), ("ipad", "iOS"), ("ios", "iOS"),
+        ("android", "Android"), ("window", "Windows"), ("linux", "Linux"),
+    ):
+        if token in low:
+            candidate = PLATFORM_UA[name]
+            if candidate != current_ua:
+                return candidate
+    return None
+
+
 @retry_on_failure()
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
     """执行签到请求（带重试）"""
     r = session.post(CHECKIN_URL, headers=headers, json=PAYLOAD, timeout=TIMEOUT)
     r.raise_for_status()
     return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
+
+
+def checkin_request_adaptive(
+    session: requests.Session, headers: Dict[str, str], index: int
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """
+    执行签到请求，并在遇到「设备平台不匹配」时自动切换 UA 重试一次。
+
+    返回 (响应 JSON, 实际生效的请求头)。headers 会被就地更新为最终使用的 UA，
+    以便后续 status / points / exchange 请求复用同一平台（避免同一轮运行里平台来回跳）。
+
+    重试次数刻意限制为 1 次：签到接口是非幂等的点数结算动作，
+    过多尝试既无意义也可能加重风控。
+    """
+    j = checkin_request(session, headers)
+    if not is_device_mismatch(j):
+        return j, headers
+
+    current_ua = headers.get("user-agent", "")
+    login_device = str(j.get("loginDevice") or j.get("device") or j.get("platform") or "")
+    logger.warning(
+        "账号 %d 命中 GLaDOS 设备平台校验: code=%s reason=%s loginDevice=%s 当前UA平台=%s",
+        index, j.get("code"), j.get("reason") or "-", login_device or "未提供", ua_platform(current_ua),
+    )
+    logger.debug("账号 %d 签到原始响应: %s", index, json.dumps(j, ensure_ascii=False)[:500])
+
+    target = pick_ua_for_device(login_device, current_ua)
+    if target is None:
+        # 服务端没给出 loginDevice（或平台名未收录）时的兜底：
+        # 优先用显式配置的平台（GLADOS_UA_PLATFORM / GLADOS_USER_AGENT 已由 resolve 处理），
+        # 否则试一次 macOS——现网桌面端登录绝大多数是 mac/win，且本补丁默认 UA 已是 Windows。
+        env_platform = (os.getenv("GLADOS_UA_PLATFORM") or "").strip()
+        if env_platform:
+            for name, value in PLATFORM_UA.items():
+                if name.lower() == env_platform.lower():
+                    target = value
+                    break
+        if target is None:
+            target = PLATFORM_UA[FALLBACK_UA_PLATFORM]
+
+    if target == current_ua:
+        logger.error("账号 %d 设备平台不匹配，且无法构造出不同的 UA 重试", index)
+        logger.error(DEVICE_MISMATCH_HINT)
+        return j, headers
+
+    logger.warning(
+        "账号 %d 切换 UA 平台 %s → %s 重试签到一次",
+        index, ua_platform(current_ua), ua_platform(target),
+    )
+    headers["user-agent"] = target
+    j2 = checkin_request(session, headers)
+    if is_device_mismatch(j2):
+        logger.error(
+            "账号 %d 切换 UA 后仍设备校验失败（loginDevice=%s）；%s",
+            index, str(j2.get("loginDevice") or login_device or "未提供"), DEVICE_MISMATCH_HINT,
+        )
+    return j2, headers
 
 
 @retry_on_failure()
@@ -643,8 +839,8 @@ def checkin_account(
     exchange_status = "-"  # 兑换结果描述（未配置时保持 "-"，不输出到日志）
 
     try:
-        # 1. 签到
-        j = checkin_request(session, headers)
+        # 1. 签到（命中设备平台校验时自动切换 UA 重试一次）
+        j, headers = checkin_request_adaptive(session, headers, index)
         code = j.get("code", -2)
         message = j.get("message", "")
         # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
@@ -658,7 +854,9 @@ def checkin_account(
         else:
             # 区分「服务端鉴权失败」与「其它业务失败」：鉴权失败通常是 Cookie 过期/
             # 复制不完整，需要给出「重新获取 Cookie」的可操作提示，避免与格式问题混淆。
-            if any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
+            if is_device_mismatch(j):
+                status = "❌ 设备校验失败(device-mismatch) → 需匹配登录平台 UA"
+            elif any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
                 status = f"❌ 鉴权失败({message}) → 请重新获取 Cookie"
                 logger.warning("账号 %d 鉴权失败，Cookie 可能已过期或复制不完整: %s", index, message)
             else:
@@ -769,6 +967,13 @@ def main() -> int:
         return 1  # L4：配置缺失视为失败，避免 CI 误标绿
 
     logger.info("检测到 %d 个账号", len(cookies))
+    # 打印本次请求使用的 UA 平台：GLaDOS 会校验「签到请求 UA 平台 == 登录设备平台」，
+    # 一旦出现 device-mismatch，这条日志能直接看出平台选对没有。
+    _ua_source = (
+        "GLADOS_USER_AGENT" if (os.getenv("GLADOS_USER_AGENT") or "").strip()
+        else ("GLADOS_UA_PLATFORM" if (os.getenv("GLADOS_UA_PLATFORM") or "").strip() else "内置默认")
+    )
+    logger.info("请求 UA 平台: %s（来源: %s）", ua_platform(HEADERS_BASE["user-agent"]), _ua_source)
 
     ok = fail = repeat = 0
     lines = []
